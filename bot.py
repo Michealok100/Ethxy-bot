@@ -11,16 +11,17 @@ from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 from telegram.constants import ParseMode
 
 # ── Environment ──────────────────────────────────────────────────────────────
-load_dotenv()  # loads .env file if present (local dev)
+load_dotenv()
 
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ETHERSCAN_API_KEY: str = os.environ.get("ETHERSCAN_API_KEY", "")
@@ -152,13 +153,14 @@ def _fmt_month(dt: datetime | None) -> str:
     return dt.strftime("%b %Y")
 
 
-def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -> str:
+def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -> tuple[str, InlineKeyboardMarkup | None]:
     if analysis is None:
         return (
             "🔍 *Wallet Analysis Complete*\n\n"
             f"Wallet `{queried_wallet}` has *no outgoing transactions* "
             f"in the latest {MAX_TRANSACTIONS} records\\.\n\n"
-            "_This wallet may only receive funds or has no activity yet\\._"
+            "_This wallet may only receive funds or has no activity yet\\._",
+            None
         )
 
     addr      = analysis["address"]
@@ -194,16 +196,19 @@ def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -
         f"📊 Scanned wallet sent *{esc(str(tx_count))}* txns to this address",
         f"   out of *{esc(str(total_out))}* total outgoing txns analysed\\.",
         "",
-        "📋 *Copy Address:*",
-        f"`{addr}`",
-        "",
         f"🔗 [View on Etherscan](https://etherscan.io/address/{addr})",
     ]
-    return "\n".join(lines)
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Copy Address", callback_data=f"copy:{addr}")],
+        [InlineKeyboardButton("🔗 View on Etherscan", url=f"https://etherscan.io/address/{addr}")],
+    ])
+
+    return "\n".join(lines), keyboard
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  VALIDATION
+#  VALIDATION HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_valid_eth_address(addr: str) -> bool:
@@ -270,10 +275,14 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         analysis = analyze_wallet(wallet, transactions)
-        result   = format_result(wallet, analysis, len(transactions))
+        result, keyboard = format_result(wallet, analysis, len(transactions))
 
         await scanning_msg.delete()
-        await update.message.reply_text(result, parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text(
+            result,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=keyboard,
+        )
 
     except RuntimeError as exc:
         logger.warning("RuntimeError for wallet %s: %s", wallet, exc)
@@ -286,6 +295,19 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await scanning_msg.edit_text(
             "❌ *An unexpected error occurred\\.*\n\n"
             "_Please try again in a few moments\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+
+async def handle_copy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the 📋 Copy Address button tap."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data and query.data.startswith("copy:"):
+        address = query.data.split("copy:", 1)[1]
+        await query.message.reply_text(
+            f"📋 *Tap and hold to copy:*\n\n`{address}`",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
 
@@ -310,9 +332,10 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("trace", cmd_trace))
+    app.add_handler(CallbackQueryHandler(handle_copy_callback, pattern=r"^copy:"))
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=["message"])
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
