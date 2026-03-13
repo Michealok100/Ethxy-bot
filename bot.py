@@ -40,7 +40,7 @@ if not ETHERSCAN_API_KEY:
     )
 
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
-MAX_TRANSACTIONS = 1000          # cap to avoid timeouts
+MAX_TRANSACTIONS = 1000
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -56,22 +56,16 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_transactions(wallet: str) -> list[dict]:
-    """
-    Fetch the latest MAX_TRANSACTIONS normal (ETH) transactions for *wallet*
-    from the Etherscan API.
-
-    Returns a list of raw transaction dicts or raises RuntimeError on failure.
-    """
     params = {
-        "chainid":    1,              # 1 = Ethereum mainnet (required by V2)
+        "chainid":    "1",
         "module":     "account",
         "action":     "txlist",
         "address":    wallet,
-        "startblock": 0,
-        "endblock":   99_999_999,
-        "page":       1,
-        "offset":     MAX_TRANSACTIONS,
-        "sort":       "desc",          # newest first so we capture recent activity
+        "startblock": "0",
+        "endblock":   "99999999",
+        "page":       "1",
+        "offset":     str(MAX_TRANSACTIONS),
+        "sort":       "desc",
         "apikey":     ETHERSCAN_API_KEY,
     }
 
@@ -85,14 +79,13 @@ def fetch_transactions(wallet: str) -> list[dict]:
         raise RuntimeError(f"Network error contacting Etherscan: {exc}")
 
     payload = response.json()
+    logger.info("Etherscan raw response: %s", payload)
 
-    # Etherscan returns status "0" with message "No transactions found" for empty wallets
     if payload.get("status") == "0":
         msg = payload.get("message", "")
         result = payload.get("result", "")
         if "No transactions found" in (msg + str(result)):
             return []
-        # Rate-limit or auth error
         raise RuntimeError(f"Etherscan error: {payload.get('result', msg)}")
 
     if payload.get("status") != "1":
@@ -106,37 +99,18 @@ def fetch_transactions(wallet: str) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def analyze_wallet(wallet: str, transactions: list[dict]) -> dict | None:
-    """
-    Filter outgoing transactions and compute per-recipient statistics.
-
-    Returns a dict with the top-recipient data, or None if there are no
-    outgoing transactions.
-
-    Schema returned:
-    {
-        "address":      str,          # top recipient address
-        "tx_count":     int,          # number of outgoing txns to them
-        "total_eth":    float,        # total ETH sent (in Ether)
-        "first_ts":     datetime,     # earliest transaction timestamp (UTC)
-        "last_ts":      datetime,     # latest  transaction timestamp (UTC)
-        "total_out_txns": int,        # total outgoing txns across all recipients
-    }
-    """
     wallet_lower = wallet.lower()
-
-    # Aggregate by recipient
-    recipient_txns:  dict[str, list[dict]] = defaultdict(list)
+    recipient_txns: dict[str, list[dict]] = defaultdict(list)
 
     for tx in transactions:
         sender = tx.get("from", "").lower()
         to     = tx.get("to",   "").lower()
 
-        # Only count outgoing, non-contract-creation, non-error transactions
         if sender != wallet_lower:
             continue
-        if not to:                          # contract creation — skip
+        if not to:
             continue
-        if tx.get("isError") == "1":        # failed tx — skip
+        if tx.get("isError") == "1":
             continue
 
         recipient_txns[to].append(tx)
@@ -144,15 +118,12 @@ def analyze_wallet(wallet: str, transactions: list[dict]) -> dict | None:
     if not recipient_txns:
         return None
 
-    # Find the recipient with the most transactions
     top_address = max(recipient_txns, key=lambda addr: len(recipient_txns[addr]))
     top_txns    = recipient_txns[top_address]
 
-    # Sum ETH sent (value is in Wei)
     total_wei = sum(int(tx.get("value", 0)) for tx in top_txns)
     total_eth = total_wei / 1e18
 
-    # Determine activity window
     timestamps = [
         datetime.fromtimestamp(int(tx["timeStamp"]), tz=timezone.utc)
         for tx in top_txns
@@ -176,17 +147,12 @@ def analyze_wallet(wallet: str, transactions: list[dict]) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fmt_month(dt: datetime | None) -> str:
-    """Return 'Mon YYYY' string or 'N/A' for a datetime."""
     if dt is None:
         return "N/A"
     return dt.strftime("%b %Y")
 
 
 def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -> str:
-    """
-    Build the Telegram-ready Markdown message for the analysis result.
-    Uses MarkdownV2 escaping where required for special characters.
-    """
     if analysis is None:
         return (
             "🔍 *Wallet Analysis Complete*\n\n"
@@ -202,7 +168,6 @@ def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -
     last_str  = _fmt_month(analysis["last_ts"])
     total_out = analysis["total_out_txns"]
 
-    # Determine period label
     if analysis["first_ts"] and analysis["last_ts"]:
         if first_str == last_str:
             period = first_str
@@ -211,9 +176,7 @@ def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -
     else:
         period = "Unknown"
 
-    # Escape MarkdownV2 special chars in dynamic strings
     def esc(s: str) -> str:
-        """Escape special MarkdownV2 characters."""
         specials = r"\_*[]()~`>#+-=|{}.!"
         return "".join(f"\\{c}" if c in specials else c for s in [s] for c in s)
 
@@ -240,20 +203,18 @@ def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  VALIDATION HELPERS
+#  VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_valid_eth_address(addr: str) -> bool:
-    """Return True if *addr* matches the Ethereum address pattern."""
     return bool(ETH_ADDRESS_RE.match(addr))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TELEGRAM COMMAND HANDLERS
+#  TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start — send the welcome / usage message."""
     text = (
         "👋 *Welcome to the Ethereum Wallet Analyzer Bot\\!*\n\n"
         "I trace Ethereum wallet activity and identify the address that "
@@ -275,17 +236,6 @@ async def cmd_start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle /trace <wallet_address>.
-
-    Flow:
-    1. Validate the supplied address.
-    2. Send a "Scanning…" acknowledgement.
-    3. Fetch transactions via Etherscan.
-    4. Analyse outgoing transaction patterns.
-    5. Format and reply with the result.
-    """
-    # ── Parse argument ────────────────────────────────────────────────────────
     if not context.args:
         await update.message.reply_text(
             "⚠️ Please provide a wallet address\\.\n\n"
@@ -305,7 +255,6 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # ── Acknowledge & scan ────────────────────────────────────────────────────
     scanning_msg = await update.message.reply_text(
         f"🔄 *Scanning wallet…*\n\n`{wallet}`\n\n_Fetching up to {MAX_TRANSACTIONS:,} transactions\\.\\.\\._",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -314,7 +263,6 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         transactions = fetch_transactions(wallet)
 
-        # Update progress
         await scanning_msg.edit_text(
             f"⚙️ *Analysing transactions…*\n\n`{wallet}`\n\n"
             f"_Found {len(transactions):,} transactions\\. Crunching numbers\\.\\.\\._",
@@ -324,7 +272,6 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         analysis = analyze_wallet(wallet, transactions)
         result   = format_result(wallet, analysis, len(transactions))
 
-        # Deliver final result (delete progress msg, send clean reply)
         await scanning_msg.delete()
         await update.message.reply_text(result, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -334,7 +281,7 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"❌ *Error during analysis*\n\n{_esc_v2(str(exc))}",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("Unexpected error for wallet %s", wallet)
         await scanning_msg.edit_text(
             "❌ *An unexpected error occurred\\.*\n\n"
@@ -344,7 +291,6 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _esc_v2(text: str) -> str:
-    """Escape a plain string for safe MarkdownV2 rendering."""
     specials = r"\_*[]()~`>#+-=|{}.!"
     return "".join(f"\\{c}" if c in specials else c for c in text)
 
@@ -354,7 +300,6 @@ def _esc_v2(text: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    """Build and start the Telegram bot (long-polling mode)."""
     logger.info("Starting Ethereum Wallet Analyzer Bot…")
 
     app = (
