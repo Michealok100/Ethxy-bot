@@ -20,12 +20,26 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # ── Environment ──────────────────────────────────────────────────────────────
-load_dotenv()
+load_dotenv()  # loads .env file if present (local dev)
 
-TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
-ETHERSCAN_API_KEY: str = os.environ["ETHERSCAN_API_KEY"]
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ETHERSCAN_API_KEY: str = os.environ.get("ETHERSCAN_API_KEY", "")
 
-ETHERSCAN_BASE_URL = "https://api.etherscan.io/api"
+if not TELEGRAM_BOT_TOKEN:
+    raise SystemExit(
+        "\n❌ ERROR: TELEGRAM_BOT_TOKEN is not set.\n"
+        "  • Local: add it to your .env file\n"
+        "  • Railway: add it in the Variables tab\n"
+    )
+
+if not ETHERSCAN_API_KEY:
+    raise SystemExit(
+        "\n❌ ERROR: ETHERSCAN_API_KEY is not set.\n"
+        "  • Local: add it to your .env file\n"
+        "  • Railway: add it in the Variables tab\n"
+    )
+
+ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
 MAX_TRANSACTIONS = 1000          # cap to avoid timeouts
 ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -49,6 +63,7 @@ def fetch_transactions(wallet: str) -> list[dict]:
     Returns a list of raw transaction dicts or raises RuntimeError on failure.
     """
     params = {
+        "chainid":    1,              # 1 = Ethereum mainnet (required by V2)
         "module":     "account",
         "action":     "txlist",
         "address":    wallet,
