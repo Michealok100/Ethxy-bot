@@ -95,6 +95,67 @@ def fetch_transactions(wallet: str) -> list[dict]:
     return payload["result"]
 
 
+def fetch_recipient_stats(address: str) -> dict:
+    """Fetch total ETH received and current balance for a given address."""
+
+    # ── Current balance ───────────────────────────────────────────────────────
+    balance_params = {
+        "chainid": "1",
+        "module":  "account",
+        "action":  "balance",
+        "address": address,
+        "tag":     "latest",
+        "apikey":  ETHERSCAN_API_KEY,
+    }
+    try:
+        resp = requests.get(ETHERSCAN_BASE_URL, params=balance_params, timeout=20)
+        resp.raise_for_status()
+        bal_payload = resp.json()
+        current_balance_eth = (
+            int(bal_payload["result"]) / 1e18
+            if bal_payload.get("status") == "1"
+            else None
+        )
+    except Exception:
+        current_balance_eth = None
+
+    # ── Incoming transactions (up to 1 000) to sum received ETH ───────────────
+    txlist_params = {
+        "chainid":    "1",
+        "module":     "account",
+        "action":     "txlist",
+        "address":    address,
+        "startblock": "0",
+        "endblock":   "99999999",
+        "page":       "1",
+        "offset":     str(MAX_TRANSACTIONS),
+        "sort":       "desc",
+        "apikey":     ETHERSCAN_API_KEY,
+    }
+    try:
+        resp = requests.get(ETHERSCAN_BASE_URL, params=txlist_params, timeout=20)
+        resp.raise_for_status()
+        tx_payload = resp.json()
+        txns = tx_payload["result"] if tx_payload.get("status") == "1" else []
+    except Exception:
+        txns = []
+
+    addr_lower = address.lower()
+    total_received_wei = sum(
+        int(tx.get("value", 0))
+        for tx in txns
+        if tx.get("to", "").lower() == addr_lower
+        and tx.get("isError") != "1"
+    )
+    total_received_eth = total_received_wei / 1e18 if txns else None
+
+    return {
+        "current_balance_eth": current_balance_eth,
+        "total_received_eth":  total_received_eth,
+        "sample_size":         len(txns),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  ANALYSIS LAYER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -153,7 +214,12 @@ def _fmt_month(dt: datetime | None) -> str:
     return dt.strftime("%b %Y")
 
 
-def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -> tuple[str, InlineKeyboardMarkup | None]:
+def format_result(
+    queried_wallet: str,
+    analysis: dict | None,
+    total_txns: int,
+    recipient_stats: dict | None = None,
+) -> tuple[str, InlineKeyboardMarkup | None]:
     if analysis is None:
         return (
             "🔍 *Wallet Analysis Complete*\n\n"
@@ -182,15 +248,37 @@ def format_result(queried_wallet: str, analysis: dict | None, total_txns: int) -
         specials = r"\_*[]()~`>#+-=|{}.!"
         return "".join(f"\\{c}" if c in specials else c for s in [s] for c in s)
 
-    eth_display = f"{eth_val:.4f}".rstrip("0").rstrip(".")
+    def fmt_eth(val: float) -> str:
+        return f"{val:.4f}".rstrip("0").rstrip(".")
+
+    eth_display = fmt_eth(eth_val)
 
     lines = [
         "🔎 *Top Recipient Wallet*",
         "",
         f"📬 *Address:* `{addr}`",
         f"🔁 *Transactions Received:* {esc(str(tx_count))}",
-        f"💰 *Total ETH Sent:* {esc(eth_display)} ETH",
+        f"💰 *ETH Sent by Traced Wallet:* {esc(eth_display)} ETH",
         f"📅 *Activity Period:* {esc(period)}",
+    ]
+
+    # ── Recipient address stats ───────────────────────────────────────────────
+    if recipient_stats:
+        lines.append("")
+        lines.append("─────────────────────────")
+        lines.append("📥 *Recipient Address Stats*")
+
+        rcv = recipient_stats.get("total_received_eth")
+        bal = recipient_stats.get("current_balance_eth")
+        sample = recipient_stats.get("sample_size", 0)
+
+        if rcv is not None:
+            suffix = f" \\(from latest {esc(str(sample))} txns\\)" if sample else ""
+            lines.append(f"⬇️ *Total ETH Received:* {esc(fmt_eth(rcv))} ETH{suffix}")
+        if bal is not None:
+            lines.append(f"🏦 *Current Balance:* {esc(fmt_eth(bal))} ETH")
+
+    lines += [
         "",
         "─────────────────────────",
         f"📊 Scanned wallet sent *{esc(str(tx_count))}* txns to this address",
@@ -275,7 +363,17 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         analysis = analyze_wallet(wallet, transactions)
-        result, keyboard = format_result(wallet, analysis, len(transactions))
+
+        recipient_stats: dict | None = None
+        if analysis:
+            await scanning_msg.edit_text(
+                f"📥 *Fetching recipient stats…*\n\n`{wallet}`\n\n"
+                f"_Analysing top recipient address\\.\\.\\._",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            recipient_stats = fetch_recipient_stats(analysis["address"])
+
+        result, keyboard = format_result(wallet, analysis, len(transactions), recipient_stats)
 
         await scanning_msg.delete()
         await update.message.reply_text(
