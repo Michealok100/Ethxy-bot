@@ -1,10 +1,12 @@
 """
 Ethereum Wallet Analyzer Telegram Bot
 Traces wallet activity and identifies top transaction recipients via Etherscan API.
+Now shows USD values and current balance (ETH + USD) for both wallets.
 """
 
 import os
 import re
+import time
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -24,7 +26,7 @@ from telegram.constants import ParseMode
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ETHERSCAN_API_KEY: str = os.environ.get("ETHERSCAN_API_KEY", "")
+ETHERSCAN_API_KEY:  str = os.environ.get("ETHERSCAN_API_KEY",  "")
 
 if not TELEGRAM_BOT_TOKEN:
     raise SystemExit(
@@ -40,9 +42,10 @@ if not ETHERSCAN_API_KEY:
         "  • Railway: add it in the Variables tab\n"
     )
 
-ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
-MAX_TRANSACTIONS = 1000
-ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+ETHERSCAN_BASE_URL  = "https://api.etherscan.io/v2/api"
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+MAX_TRANSACTIONS    = 1000
+ETH_ADDRESS_RE      = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -50,6 +53,48 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ETH PRICE (cached 60 s to avoid CoinGecko rate limits)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_price_cache: dict = {"price": 0.0, "updated": 0.0}
+_PRICE_TTL = 60  # seconds
+
+
+def fetch_eth_price_usd() -> float:
+    """Return live ETH/USD price, cached for 60 s."""
+    now = time.time()
+    if now - _price_cache["updated"] < _PRICE_TTL and _price_cache["price"]:
+        return _price_cache["price"]
+    try:
+        resp = requests.get(
+            COINGECKO_PRICE_URL,
+            params={"ids": "ethereum", "vs_currencies": "usd"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        price = float(resp.json()["ethereum"]["usd"])
+        _price_cache["price"]   = price
+        _price_cache["updated"] = now
+        logger.info("ETH price refreshed: $%.2f", price)
+        return price
+    except Exception as exc:
+        logger.warning("Could not fetch ETH price: %s", exc)
+        return _price_cache["price"] or 0.0
+
+
+def eth_to_usd(eth: float, price: float) -> float:
+    return eth * price
+
+
+def fmt_usd(usd: float) -> str:
+    if usd >= 1_000_000:
+        return f"${usd/1_000_000:.2f}M"
+    if usd >= 1_000:
+        return f"${usd:,.0f}"
+    return f"${usd:.2f}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -80,11 +125,10 @@ def fetch_transactions(wallet: str) -> list[dict]:
         raise RuntimeError(f"Network error contacting Etherscan: {exc}")
 
     payload = response.json()
-    logger.info("Etherscan raw response: %s", payload)
 
     if payload.get("status") == "0":
-        msg = payload.get("message", "")
-        result = payload.get("result", "")
+        msg    = payload.get("message", "")
+        result = payload.get("result",  "")
         if "No transactions found" in (msg + str(result)):
             return []
         raise RuntimeError(f"Etherscan error: {payload.get('result', msg)}")
@@ -95,9 +139,14 @@ def fetch_transactions(wallet: str) -> list[dict]:
     return payload["result"]
 
 
-def fetch_recipient_stats(address: str) -> dict:
-    """Fetch total ETH received and current balance for a given address."""
-
+def fetch_wallet_stats(address: str) -> dict:
+    """
+    Fetch for a wallet:
+      - current_balance_eth  : latest on-chain balance
+      - total_received_eth   : sum of incoming ETH (last MAX_TRANSACTIONS txns)
+      - total_sent_eth       : sum of outgoing ETH (last MAX_TRANSACTIONS txns)
+      - sample_size          : number of txns examined
+    """
     # ── Current balance ───────────────────────────────────────────────────────
     balance_params = {
         "chainid": "1",
@@ -119,7 +168,7 @@ def fetch_recipient_stats(address: str) -> dict:
     except Exception:
         current_balance_eth = None
 
-    # ── Incoming transactions (up to 1 000) to sum received ETH ───────────────
+    # ── Transaction list ──────────────────────────────────────────────────────
     txlist_params = {
         "chainid":    "1",
         "module":     "account",
@@ -141,17 +190,24 @@ def fetch_recipient_stats(address: str) -> dict:
         txns = []
 
     addr_lower = address.lower()
+
     total_received_wei = sum(
         int(tx.get("value", 0))
         for tx in txns
-        if tx.get("to", "").lower() == addr_lower
+        if tx.get("to",   "").lower() == addr_lower
         and tx.get("isError") != "1"
     )
-    total_received_eth = total_received_wei / 1e18 if txns else None
+    total_sent_wei = sum(
+        int(tx.get("value", 0))
+        for tx in txns
+        if tx.get("from", "").lower() == addr_lower
+        and tx.get("isError") != "1"
+    )
 
     return {
         "current_balance_eth": current_balance_eth,
-        "total_received_eth":  total_received_eth,
+        "total_received_eth":  total_received_wei / 1e18 if txns else None,
+        "total_sent_eth":      total_sent_wei      / 1e18 if txns else None,
         "sample_size":         len(txns),
     }
 
@@ -209,24 +265,45 @@ def analyze_wallet(wallet: str, transactions: list[dict]) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fmt_month(dt: datetime | None) -> str:
-    if dt is None:
-        return "N/A"
-    return dt.strftime("%b %Y")
+    return dt.strftime("%b %Y") if dt else "N/A"
+
+
+def esc(s: str) -> str:
+    specials = r"\_*[]()~`>#+-=|{}.!"
+    return "".join(f"\\{c}" if c in specials else c for c in str(s))
+
+
+def fmt_eth(val: float) -> str:
+    return f"{val:.4f}".rstrip("0").rstrip(".")
+
+
+def eth_line(label: str, eth_val: float | None, price: float, suffix: str = "") -> str:
+    """Return a formatted line showing both ETH and USD values."""
+    if eth_val is None:
+        return f"{label} N/A"
+    usd_val  = eth_to_usd(eth_val, price)
+    eth_str  = esc(fmt_eth(eth_val))
+    usd_str  = esc(fmt_usd(usd_val)) if price else "USD N/A"
+    suf      = esc(suffix)
+    return f"{label} {eth_str} ETH \\(≈ {usd_str}\\){suf}"
 
 
 def format_result(
-    queried_wallet: str,
-    analysis: dict | None,
-    total_txns: int,
+    queried_wallet:  str,
+    analysis:        dict | None,
+    total_txns:      int,
+    sender_stats:    dict | None = None,
     recipient_stats: dict | None = None,
+    eth_price:       float = 0.0,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
+
     if analysis is None:
         return (
             "🔍 *Wallet Analysis Complete*\n\n"
             f"Wallet `{queried_wallet}` has *no outgoing transactions* "
             f"in the latest {MAX_TRANSACTIONS} records\\.\n\n"
             "_This wallet may only receive funds or has no activity yet\\._",
-            None
+            None,
         )
 
     addr      = analysis["address"]
@@ -236,47 +313,52 @@ def format_result(
     last_str  = _fmt_month(analysis["last_ts"])
     total_out = analysis["total_out_txns"]
 
-    if analysis["first_ts"] and analysis["last_ts"]:
-        if first_str == last_str:
-            period = first_str
-        else:
-            period = f"{first_str} → {last_str}"
-    else:
-        period = "Unknown"
+    period = (
+        first_str if first_str == last_str
+        else f"{first_str} → {last_str}"
+    ) if analysis["first_ts"] and analysis["last_ts"] else "Unknown"
 
-    def esc(s: str) -> str:
-        specials = r"\_*[]()~`>#+-=|{}.!"
-        return "".join(f"\\{c}" if c in specials else c for s in [s] for c in s)
-
-    def fmt_eth(val: float) -> str:
-        return f"{val:.4f}".rstrip("0").rstrip(".")
-
-    eth_display = fmt_eth(eth_val)
+    price_note = (
+        f"_ETH price used: {esc(fmt_usd(eth_price))}_"
+        if eth_price else "_\\(USD conversion unavailable\\)_"
+    )
 
     lines = [
         "🔎 *Top Recipient Wallet*",
         "",
+        price_note,
+        "",
         f"📬 *Address:* `{addr}`",
-        f"🔁 *Transactions Received:* {esc(str(tx_count))}",
-        f"💰 *ETH Sent by Traced Wallet:* {esc(eth_display)} ETH",
+        f"🔁 *Transactions to this address:* {esc(str(tx_count))}",
+        eth_line("💸 *ETH sent to recipient:*", eth_val, eth_price),
         f"📅 *Activity Period:* {esc(period)}",
     ]
 
-    # ── Recipient address stats ───────────────────────────────────────────────
+    # ── Sender wallet stats ───────────────────────────────────────────────────
+    if sender_stats:
+        sample = sender_stats.get("sample_size", 0)
+        suf    = f" (last {sample:,} txns)" if sample else ""
+        lines += [
+            "",
+            "─────────────────────────",
+            f"👤 *Sender Wallet Stats* \\(`{esc(queried_wallet[:8])}…`\\)",
+            eth_line("🏦 *Current Balance:*",  sender_stats.get("current_balance_eth"),  eth_price),
+            eth_line("📤 *Total Sent:*",        sender_stats.get("total_sent_eth"),       eth_price, suf),
+            eth_line("📥 *Total Received:*",    sender_stats.get("total_received_eth"),   eth_price, suf),
+        ]
+
+    # ── Recipient wallet stats ────────────────────────────────────────────────
     if recipient_stats:
-        lines.append("")
-        lines.append("─────────────────────────")
-        lines.append("📥 *Recipient Address Stats*")
-
-        rcv = recipient_stats.get("total_received_eth")
-        bal = recipient_stats.get("current_balance_eth")
         sample = recipient_stats.get("sample_size", 0)
-
-        if rcv is not None:
-            suffix = f" \\(from latest {esc(str(sample))} txns\\)" if sample else ""
-            lines.append(f"⬇️ *Total ETH Received:* {esc(fmt_eth(rcv))} ETH{suffix}")
-        if bal is not None:
-            lines.append(f"🏦 *Current Balance:* {esc(fmt_eth(bal))} ETH")
+        suf    = f" (last {sample:,} txns)" if sample else ""
+        lines += [
+            "",
+            "─────────────────────────",
+            f"🎯 *Recipient Wallet Stats* \\(`{esc(addr[:8])}…`\\)",
+            eth_line("🏦 *Current Balance:*",  recipient_stats.get("current_balance_eth"),  eth_price),
+            eth_line("📥 *Total Received:*",   recipient_stats.get("total_received_eth"),   eth_price, suf),
+            eth_line("📤 *Total Sent:*",       recipient_stats.get("total_sent_eth"),       eth_price, suf),
+        ]
 
     lines += [
         "",
@@ -303,6 +385,11 @@ def is_valid_eth_address(addr: str) -> bool:
     return bool(ETH_ADDRESS_RE.match(addr))
 
 
+def _esc_v2(text: str) -> str:
+    specials = r"\_*[]()~`>#+-=|{}.!"
+    return "".join(f"\\{c}" if c in specials else c for c in text)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,7 +408,9 @@ async def cmd_start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None
         "📊 *What you'll get:*\n"
         "• Top recipient wallet address\n"
         "• Number of transactions sent\n"
-        "• Total ETH transferred\n"
+        "• Total ETH transferred \\+ USD value\n"
+        "• Current ETH balance \\+ USD value for both wallets\n"
+        "• Total ETH sent/received \\+ USD for both wallets\n"
         "• Activity time period\n\n"
         "_Analysis covers up to the latest 1,000 transactions\\._"
     )
@@ -354,26 +443,54 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
+        # 1. Fetch ETH price first (used for all USD conversions)
+        await scanning_msg.edit_text(
+            f"💱 *Fetching ETH price…*\n\n`{wallet}`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        eth_price = fetch_eth_price_usd()
+
+        # 2. Fetch transactions for the queried wallet
+        await scanning_msg.edit_text(
+            f"🔄 *Scanning wallet…*\n\n`{wallet}`\n\n_Fetching up to {MAX_TRANSACTIONS:,} transactions\\.\\.\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
         transactions = fetch_transactions(wallet)
 
+        # 3. Analyse
         await scanning_msg.edit_text(
             f"⚙️ *Analysing transactions…*\n\n`{wallet}`\n\n"
             f"_Found {len(transactions):,} transactions\\. Crunching numbers\\.\\.\\._",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-
         analysis = analyze_wallet(wallet, transactions)
 
+        # 4. Fetch sender wallet stats (balance + sent/received)
+        await scanning_msg.edit_text(
+            f"📊 *Fetching sender wallet stats…*\n\n`{wallet}`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        sender_stats = fetch_wallet_stats(wallet)
+
+        # 5. Fetch recipient wallet stats
         recipient_stats: dict | None = None
         if analysis:
             await scanning_msg.edit_text(
-                f"📥 *Fetching recipient stats…*\n\n`{wallet}`\n\n"
+                f"📥 *Fetching recipient wallet stats…*\n\n`{wallet}`\n\n"
                 f"_Analysing top recipient address\\.\\.\\._",
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
-            recipient_stats = fetch_recipient_stats(analysis["address"])
+            recipient_stats = fetch_wallet_stats(analysis["address"])
 
-        result, keyboard = format_result(wallet, analysis, len(transactions), recipient_stats)
+        # 6. Format and send
+        result, keyboard = format_result(
+            queried_wallet=wallet,
+            analysis=analysis,
+            total_txns=len(transactions),
+            sender_stats=sender_stats,
+            recipient_stats=recipient_stats,
+            eth_price=eth_price,
+        )
 
         await scanning_msg.delete()
         await update.message.reply_text(
@@ -388,7 +505,7 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"❌ *Error during analysis*\n\n{_esc_v2(str(exc))}",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("Unexpected error for wallet %s", wallet)
         await scanning_msg.edit_text(
             "❌ *An unexpected error occurred\\.*\n\n"
@@ -398,21 +515,14 @@ async def cmd_trace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_copy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the 📋 Copy Address button tap."""
     query = update.callback_query
     await query.answer()
-
     if query.data and query.data.startswith("copy:"):
         address = query.data.split("copy:", 1)[1]
         await query.message.reply_text(
             f"📋 *Tap and hold to copy:*\n\n`{address}`",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-
-
-def _esc_v2(text: str) -> str:
-    specials = r"\_*[]()~`>#+-=|{}.!"
-    return "".join(f"\\{c}" if c in specials else c for c in text)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -422,12 +532,7 @@ def _esc_v2(text: str) -> str:
 def main() -> None:
     logger.info("Starting Ethereum Wallet Analyzer Bot…")
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
-
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("trace", cmd_trace))
     app.add_handler(CallbackQueryHandler(handle_copy_callback, pattern=r"^copy:"))
