@@ -1,3 +1,4 @@
-python-telegram-bot==21.6
-requests==2.32.3
-python-dotenv==1.0.1
+# Ethereum Wallet Analyzer Bot v2 – Python dependencies
+python-telegram-bot==21.*
+requests>=2.31.0
+python-dotenv>=1.0.0
